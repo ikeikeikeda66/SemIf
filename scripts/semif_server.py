@@ -194,6 +194,111 @@ class SemIfRequestHandler(BaseHTTPRequestHandler):
                 logger.exception("Error during score")
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(e)})
 
+        elif self.path in ("/v1/systemone", "/v1/systemone/"):
+            state = payload.get("state")
+            questions = payload.get("questions")
+
+            if state is None or questions is None or not isinstance(questions, dict):
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"error": "Missing or invalid 'state' or 'questions' in request body"},
+                )
+                return
+
+            answers = {}
+            try:
+                for q_name, q_def in questions.items():
+                    q_type = q_def.get("type", "noul")
+                    instructions = q_def.get("instructions", "")
+
+                    if q_type == "noul":
+                        options = [
+                            {"id": "yes", "description": "Yes, true"},
+                            {"id": "no", "description": "No, false"},
+                        ]
+                        row = {
+                            "id": f"q_{q_name}",
+                            "state": state,
+                            "question": instructions,
+                            "options": options,
+                        }
+                        validate_row(row)
+                        with model_lock:
+                            res = direct_score(model, tokenizer, row, metadata)
+                        opt_ids = res["option_ids"]
+                        probs = res["probabilities"]
+                        prob_map = dict(zip(opt_ids, probs))
+                        answers[q_name] = {
+                            "type": "noul",
+                            "noul": prob_map.get("yes", 0.5),
+                        }
+                    elif q_type == "choice":
+                        criteria = q_def.get("criteria", {})
+                        if not criteria:
+                            raise ValueError(f"Question {q_name} choice criteria cannot be empty")
+                        options = [
+                            {"id": k, "description": v if v else k}
+                            for k, v in criteria.items()
+                        ]
+                        row = {
+                            "id": f"q_{q_name}",
+                            "state": state,
+                            "question": instructions,
+                            "options": options,
+                        }
+                        validate_row(row)
+                        with model_lock:
+                            res = direct_score(model, tokenizer, row, metadata)
+                        opt_ids = res["option_ids"]
+                        probs = res["probabilities"]
+                        prob_map = dict(zip(opt_ids, probs))
+                        best_choice = max(opt_ids, key=lambda opt: prob_map[opt])
+                        answers[q_name] = {
+                            "type": "choice",
+                            "choice": best_choice,
+                            "confidence": prob_map[best_choice],
+                            "probabilities": prob_map,
+                        }
+                    elif q_type == "score":
+                        criteria = q_def.get("criteria", [])
+                        if not criteria:
+                            raise ValueError(f"Question {q_name} score criteria cannot be empty")
+                        options = [
+                            {"id": str(i), "description": desc}
+                            for i, desc in enumerate(criteria)
+                        ]
+                        row = {
+                            "id": f"q_{q_name}",
+                            "state": state,
+                            "question": instructions,
+                            "options": options,
+                        }
+                        validate_row(row)
+                        with model_lock:
+                            res = direct_score(model, tokenizer, row, metadata)
+                        opt_ids = res["option_ids"]
+                        probs = res["probabilities"]
+                        prob_map = dict(zip(opt_ids, probs))
+                        expected_score = sum(i * prob_map.get(str(i), 0.0) for i in range(len(criteria)))
+                        best_idx = max(range(len(criteria)), key=lambda i: prob_map.get(str(i), 0.0))
+                        answers[q_name] = {
+                            "type": "score",
+                            "score": expected_score,
+                            "confidence": prob_map.get(str(best_idx), 0.0),
+                            "probabilities": prob_map,
+                        }
+                    else:
+                        raise ValueError(f"Unsupported question type: {q_type}")
+
+                response_data = {
+                    "model": metadata.get("source", DEFAULT_MODEL) if metadata else DEFAULT_MODEL,
+                    "answers": answers,
+                }
+                self._send_json(HTTPStatus.OK, response_data)
+            except Exception as e:
+                logger.exception("Error processing systemone request")
+                self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(e)})
+
         else:
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "Unknown endpoint", "path": self.path})
 
